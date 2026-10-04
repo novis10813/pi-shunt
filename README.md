@@ -1,38 +1,24 @@
-# pi-shunt-ripple
+# pi-shunt
 
-Two pi extensions that share one lint core.
+A pi extension. It replaces whole-file reads of large code and markdown files
+with a structure index, so the content stays out of the main context:
 
-| Extension | Hooks | What it does |
-|---|---|---|
-| [`shunt`](extensions/shunt/README.md) | `tool_result(read)`, `tool_call(bash)` | Replaces whole-file reads of large files with a structure index (tree-sitter for code, outline for markdown, profile for csv/jsonl) so the content stays out of the main context. Blocks `cat`/`head`/`tail` on large files. Registers no tool. |
-| [`ripple`](extensions/ripple/README.md) | `tool_call(edit/write)`, `tool_result`, `turn_end` | After a turn, re-runs lint on edited files and records new diagnostics and stale references to renamed files for the next request. Never changes tool output. |
+- code (`ts,tsx,js,jsx,mjs,cjs,py,rs,go,sh`): tree-sitter index with imports,
+  top-level symbols, full signatures, one level of members, and line numbers.
+- markdown: heading outline with line numbers.
 
-`shared/diagnostics/` is the lint core (biome, ruff, shellcheck) used by both.
-shunt also uses it to annotate `read` results.
+Everything runs locally. Other file types, targeted reads, and small files pass
+through unchanged. See [extensions/shunt/README.md](extensions/shunt/README.md).
 
-Both read per-project config from `<cwd>/.pi/`:
-
-- `shunt.json`: shunt settings. Without it, shunt's summaries are off.
-- `ripple.json`: ripple settings. Without it, ripple runs with defaults. Set `{"enabled": false}` to turn it off.
-- `diagnostics.json`: optional shared lint settings.
+Config is `<cwd>/.pi/shunt.json`. Without it, shunt is off.
 
 ## Install
 
-Install per project so the hooks only run where you want them:
-
 ```bash
-pi install -l git:github.com/novis10813/pi-shunt-ripple
+pi install -l git:github.com/novis10813/pi-shunt
 ```
 
-Installing without `-l` enables both extensions in every project. ripple then
-runs lint and `git grep` on every edit by default.
-
 pi runs `npm install` for the package (one dependency, `@vscode/tree-sitter-wasm`).
-
-shunt's default worker model for non-code text files is
-`cliproxyapi/gemini-3.8-flash-high`. Set `worker` in `shunt.json` to a model
-your pi has configured, or `"nonCode": "passthrough"` to never send file
-content to a model.
 
 ## Development
 
@@ -44,8 +30,6 @@ npm test
 Tests need the node that has pi installed (they resolve pi from
 `process.execPath`).
 
-## Docs
-
-`docs/` holds the original design specs. Paths such as `.pi/extensions/shunt/`
-in them refer to the layout before this repo existed. The repo root plays the
-role of `.pi/` (`extensions/`, `shared/`).
+The removed features (LLM worker, bash `cat`/`head`/`tail` blocking, csv/jsonl
+profiles, read diagnostics, ripple) are kept on the `archive/full` branch.
+Ripple now lives in [pi-ripple](https://github.com/novis10813/pi-ripple).
