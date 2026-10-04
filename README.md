@@ -29,11 +29,6 @@ runs lint and `git grep` on every edit by default.
 
 pi runs `npm install` for the package (one dependency, `@vscode/tree-sitter-wasm`).
 
-shunt's default worker model for non-code text files is
-`cliproxyapi/gemini-3.8-flash-high`. Set `worker` in `shunt.json` to a model
-your pi has configured, or `"nonCode": "passthrough"` to never send file
-content to a model.
-
 ## Development
 
 ```bash

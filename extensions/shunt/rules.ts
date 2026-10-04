@@ -3,48 +3,28 @@
  *
  * No pi imports; runnable directly under Node (see test-shunt.mjs).
  * Decides when a full-file read of a large text file should be intercepted
- * for worker summarization, and when a bash command reads a large file
+ * and replaced by a structure index, and when a bash command reads a large file
  * directly into context (to be blocked and redirected to `read`).
  */
 
-import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
 import { DEFAULT_LANGUAGES } from "./structure.ts";
 
 export interface ShuntConfig {
-	/** Worker model as "provider/modelId", e.g. "cliproxyapi/gemini-3.8-flash-high" */
-	worker: string;
 	/** Files with more than this many lines are intercepted on full reads */
 	minLines: number;
 	/** Extensions treated as code (case-insensitive). Unknown extensions stay "other". */
 	languages: string[];
-	/** Large "other" text files: "worker" (LLM summary) or "passthrough" (no interception). */
-	nonCode: "worker" | "passthrough";
 }
 
 export const DEFAULT_CONFIG: ShuntConfig = {
-	worker: "cliproxyapi/gemini-3.8-flash-high",
 	minLines: 350,
 	languages: DEFAULT_LANGUAGES,
-	nonCode: "worker",
 };
-
-/** Content ceiling for a single worker call (~well under a 1M-token context). */
-export const MAX_WORKER_CHARS = 2_000_000;
-
-/** Parse "provider/modelId"; undefined when malformed. */
-export function parseWorkerRef(ref: string): { provider: string; modelId: string } | undefined {
-	const idx = ref.indexOf("/");
-	if (idx <= 0 || idx === ref.length - 1) return undefined;
-	return { provider: ref.slice(0, idx), modelId: ref.slice(idx + 1) };
-}
 
 /** Validate a parsed shunt.json object; undefined when unusable. */
 export function normalizeConfig(raw: unknown): ShuntConfig | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const obj = raw as Record<string, unknown>;
-	const worker = typeof obj.worker === "string" && obj.worker.trim() !== "" ? obj.worker : DEFAULT_CONFIG.worker;
-	if (!parseWorkerRef(worker)) return undefined;
 	const minLines =
 		typeof obj.minLines === "number" && Number.isFinite(obj.minLines) && obj.minLines >= 0
 			? Math.max(1, Math.floor(obj.minLines))
@@ -53,8 +33,7 @@ export function normalizeConfig(raw: unknown): ShuntConfig | undefined {
 		Array.isArray(obj.languages) && obj.languages.every((x) => typeof x === "string")
 			? [...new Set(obj.languages.map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0))]
 			: DEFAULT_CONFIG.languages;
-	const nonCode: "worker" | "passthrough" = obj.nonCode === "passthrough" ? "passthrough" : "worker";
-	return { worker, minLines, languages, nonCode };
+	return { minLines, languages };
 }
 
 /**
@@ -174,15 +153,14 @@ export interface InterceptDecision {
 }
 
 /**
- * Decide whether a full-file read should be intercepted for worker
- * summarization. `buf` is the file content. Only non-targeted, text,
- * large-enough, small-enough-for-the-worker files qualify.
+ * Decide whether a full-file read should be intercepted. `buf` is the file
+ * content. Only non-targeted, text, large-enough, under-the-cap files qualify.
  */
 export function decideIntercept(
 	input: ReadInput,
 	buf: Buffer,
 	minLines: number,
-	sizeCap: number = MAX_WORKER_CHARS,
+	sizeCap: number,
 ): InterceptDecision {
 	if (isTargetedRead(input)) return { intercept: false };
 	if (!looksLikeText(buf)) return { intercept: false };
@@ -412,19 +390,4 @@ export function detectBashReads(command: string, minLines: number): BashReadHit[
 		scanCompound(compound, minLines, hits, 0);
 	}
 	return hits;
-}
-
-/** True when absPath resolves to cwd itself or below it (egress boundary). */
-export function isWithinCwd(cwd: string, absPath: string): boolean {
-	let base = resolve(cwd);
-	let target = resolve(absPath);
-	try {
-		base = realpathSync(base);
-		target = realpathSync(target);
-	} catch {
-		// Missing paths retain the lexical fallback.
-		base = resolve(cwd);
-		target = resolve(absPath);
-	}
-	return target === base || target.startsWith(base.endsWith(sep) ? base : base + sep);
 }

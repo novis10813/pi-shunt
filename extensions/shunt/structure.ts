@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 // Constants (spec §3.3–§3.5)
 // ---------------------------------------------------------------------------
 
-/** Size gate for deterministic engines (chars). Worker path keeps 2MB. */
+/** Size gate for markdown/csv/jsonl engines (chars). */
 export const MAX_DETERMINISTIC_CHARS = 20_000_000;
 /**
  * Code files larger than this pass through unread: tree-sitter's WASM parse

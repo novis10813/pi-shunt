@@ -13,18 +13,14 @@ import {
 	type ReadToolInput,
 } from "@earendil-works/pi-coding-agent";
 import {
-	MAX_WORKER_CHARS,
 	decideIntercept,
 	detectBashReads,
 	isTargetedRead,
-	isWithinCwd,
 	normalizeConfig,
-	parseWorkerRef,
 	stripPathSelector,
 	type ShuntConfig,
 } from "./rules.ts";
 import { probeLargeFile } from "./probe.ts";
-import { buildUserMessage, labelSummary, WORKER_SYSTEM_PROMPT } from "./worker.ts";
 import {
 	MAX_DETERMINISTIC_CHARS,
 	MAX_CODE_PARSE_CHARS,
@@ -44,20 +40,18 @@ import {
 /**
  * shunt — token routing for the pi coding agent.
  *
- * Offloads I/O-heavy reads to a cheaper worker model so the file corpus never
- * enters the main model's context — only a compact, navigable summary does.
+ * Keeps large file reads out of the main model's context — only a compact,
+ * navigable structure index enters it.
  *
  * Mechanism (stacks with any `read` override, e.g. the global read-selector
  * extension — shunt itself registers NO tool):
  * - read rule (tool_result hook): after a successful, non-targeted full read
  *   of a text file above minLines, the result is replaced by the first engine
  *   that succeeds (config: <cwd>/.pi/shunt.json):
- *   - code (tree-sitter, local) / markdown / csv / jsonl — deterministic
- *     structure index, no model call, up to 20MB;
- *   - other text — LLM worker summary (up to 2MB), unless nonCode is
- *     "passthrough".
- *   Targeted reads, small files, images, binaries, missing files, and every
- *   engine/worker failure keep the original result untouched (fail open).
+ *   code (tree-sitter, local) / markdown / csv / jsonl — deterministic
+ *   structure index, no model call, up to 20MB.
+ *   Targeted reads, small files, other file types, images, binaries, missing
+ *   files, and every engine failure keep the original result untouched (fail open).
  * - bash rule (tool_call hook): blocks `cat|head|tail|less|more` on large
  *   files and redirects to the read tool. Piped/redirected/bounded-targeted
  *   usage passes through.
@@ -66,9 +60,7 @@ import {
  * string-based, like guard's. See README.md next to this file.
  */
 
-const WORKER_TIMEOUT_MS = 60_000;
-
-/** Bounded in-memory LRU (64 entries per cache) shared by the two caches below. */
+/** Bounded in-memory LRU (64 entries). */
 const CACHE_MAX = 64;
 function lruGet<V>(cache: Map<string, V>, key: string): V | undefined {
 	const value = cache.get(key);
@@ -90,10 +82,6 @@ const structCache = new Map<string, { text: string; engine: EngineName; lines: n
 const structCacheGet = (key: string) => lruGet(structCache, key);
 const structCacheSet = (key: string, value: { text: string; engine: EngineName; lines: number }) => lruSet(structCache, key, value);
 
-/** Worker summaries of non-code text: a re-read of an unchanged file must not
- *  repeat the remote LLM call (up to 60s + tokens). Successes only. */
-const workerCache = new Map<string, string>();
-
 /** Per-extension-instance "announced once" set so fail-open warnings don't spam. */
 const announced = new Set<string>();
 function announceOnce(ctx: ExtensionContext, key: string, message: string) {
@@ -113,58 +101,6 @@ function loadConfig(cwd: string): ShuntConfig | undefined {
 	}
 }
 
-/**
- * One-shot worker call. Returns the summary text, or undefined on any
- * failure (caller keeps the original result).
- */
-async function runWorker(
-	ctx: ExtensionContext,
-	cfg: ShuntConfig,
-	files: Array<{ path: string; content: string }>,
-	signal: AbortSignal | undefined,
-): Promise<string | undefined> {
-	const ref = parseWorkerRef(cfg.worker);
-	if (!ref) return undefined;
-	const model = ctx.modelRegistry.find(ref.provider, ref.modelId);
-	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
-		announceOnce(ctx, `worker-missing:${cfg.worker}`, `shunt: worker model ${cfg.worker} not available — falling back to direct reads.`);
-		return undefined;
-	}
-
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), WORKER_TIMEOUT_MS);
-	const onAbort = () => controller.abort();
-	signal?.addEventListener("abort", onAbort, { once: true });
-	try {
-		const response = await ctx.modelRegistry.complete(
-			model,
-			{
-				systemPrompt: WORKER_SYSTEM_PROMPT,
-				messages: [{ role: "user", content: buildUserMessage(files), timestamp: Date.now() }],
-			},
-			// reasoningEffort follows the official summarize.ts example; the
-			// openai-completions adapter maps it onto the provider parameter.
-			{ reasoningEffort: "low", cacheRetention: "none", signal: controller.signal, timeoutMs: WORKER_TIMEOUT_MS },
-		);
-		const text = response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n")
-			.trim();
-		if (!text) return undefined;
-		if (ctx.hasUI) {
-			ctx.ui.notify(`shunt: summarized via ${model.provider}/${model.id} (${response.usage?.totalTokens ?? "?"} tokens)`, "info");
-		}
-		return text;
-	} catch {
-		announceOnce(ctx, "worker-failed", "shunt: worker summarization failed — falling back to direct reads.");
-		return undefined;
-	} finally {
-		clearTimeout(timer);
-		signal?.removeEventListener("abort", onAbort);
-	}
-}
-
 /** readFile that returns an empty buffer on error, so decision code never throws. */
 async function safeRead(cwd: string, path: string): Promise<Buffer> {
 	try {
@@ -176,7 +112,7 @@ async function safeRead(cwd: string, path: string): Promise<Buffer> {
 
 export default function (pi: ExtensionAPI) {
 	// Read rule: after a successful non-targeted full read, replace the result
-	// with a worker summary when the file is large. Returning undefined keeps
+	// with a structure index when the file is large. Returning undefined keeps
 	// the original result — so every pass-through is behaviorally identical
 	// to shunt not existing.
 	pi.on("tool_result", async (event, ctx) => {
@@ -232,107 +168,72 @@ export default function (pi: ExtensionAPI) {
 		if (!st.isFile()) return;
 		// Spec §3.1: the size cap is chosen after stat, by extension only
 		// (no read needed) — md/csv/jsonl get 20MB; code gets 1MB, because
-		// tree-sitter's synchronous WASM parse must not stall the session;
-		// the worker gets 2MB.
+		// tree-sitter's synchronous WASM parse must not stall the session.
 		const kind = detectKind(basePath, cfg.languages);
-		const sizeCap = kind === "other" ? MAX_WORKER_CHARS : kind === "code" ? MAX_CODE_PARSE_CHARS : MAX_DETERMINISTIC_CHARS;
+		if (kind === "other") return decorate();
+		const sizeCap = kind === "code" ? MAX_CODE_PARSE_CHARS : MAX_DETERMINISTIC_CHARS;
 		if (st.size > sizeCap) return decorate();
 
 		// Deterministic track (code / markdown / csv / jsonl) — fully local, no
-		// model call. Any failure falls through to the worker track (fail open).
+		// model call. Any failure keeps the original result (fail open).
 		// The cache key is stat+config only, so a hit implies unchanged content —
 		// serve it before reading the file at all. Config in the key: a
-		// mid-session edit of `languages`/`nonCode`/`minLines` must not serve an
+		// mid-session edit of `languages`/`minLines` must not serve an
 		// index rendered or decided under the old config.
-		let cacheKey: string | undefined;
-		if (kind !== "other") {
-			cacheKey = `${absPath}\u0000${st.mtimeMs}\u0000${st.size}\u0000${cfg.minLines}\u0000${cfg.languages.join(",")}\u0000${cfg.nonCode}`;
-			const cached = structCacheGet(cacheKey);
-			if (cached) {
-				return decorate({
-					content: [{ type: "text", text: cached.text }],
-					details: { shunt: true, engine: cached.engine, lines: cached.lines },
-				});
-			}
+		const cacheKey = `${absPath}\u0000${st.mtimeMs}\u0000${st.size}\u0000${cfg.minLines}\u0000${cfg.languages.join(",")}`;
+		const cached = structCacheGet(cacheKey);
+		if (cached) {
+			return decorate({
+				content: [{ type: "text", text: cached.text }],
+				details: { shunt: true, engine: cached.engine, lines: cached.lines },
+			});
 		}
 
 		const buf = await safeRead(ctx.cwd, basePath);
 		const decision = decideIntercept(input, buf, cfg.minLines, sizeCap);
 		if (!decision.intercept || !decision.lines) return decorate();
 
-		if (kind !== "other" && cacheKey) {
-			const text = buf.toString("utf8");
-			let engine: EngineName | undefined;
-			let body: string[] | undefined;
-			if (kind === "code") {
-				const grammar = grammarForPath(basePath, cfg.languages);
-				if (grammar) {
-					const eng = await initStructureEngine();
-					if (!eng) {
-						announceOnce(
-							ctx,
-							"structure-engine-missing",
-							"shunt: tree-sitter engine unavailable — code files pass through unchanged.",
-						);
-					} else {
-						const ci = await buildCodeIndex(text, grammar);
-						if (ci) {
-							engine = "tree-sitter";
-							body = renderCodeIndex(ci);
-						}
+		const text = buf.toString("utf8");
+		let engine: EngineName | undefined;
+		let body: string[] | undefined;
+		if (kind === "code") {
+			const grammar = grammarForPath(basePath, cfg.languages);
+			if (grammar) {
+				const eng = await initStructureEngine();
+				if (!eng) {
+					announceOnce(
+						ctx,
+						"structure-engine-missing",
+						"shunt: tree-sitter engine unavailable — code files pass through unchanged.",
+					);
+				} else {
+					const ci = await buildCodeIndex(text, grammar);
+					if (ci) {
+						engine = "tree-sitter";
+						body = renderCodeIndex(ci);
 					}
 				}
-			} else if (kind === "markdown") {
-				body = buildMarkdownOutline(text);
-				engine = body ? "markdown" : undefined;
-			} else if (kind === "csv") {
-				body = buildCsvProfile(text, extensionOf(basePath) === "tsv" ? "\t" : ",");
-				engine = "csv";
-			} else {
-				body = buildJsonlProfile(text);
-				engine = body ? "jsonl" : undefined;
 			}
-			if (engine && body) {
-				const rendered = renderStructure(input.path, decision.lines, engine, body);
-				structCacheSet(cacheKey, { text: rendered, engine, lines: decision.lines });
-				return decorate({
-					content: [{ type: "text", text: rendered }],
-					details: { shunt: true, engine, lines: decision.lines },
-				});
-			}
+		} else if (kind === "markdown") {
+			body = buildMarkdownOutline(text);
+			engine = body ? "markdown" : undefined;
+		} else if (kind === "csv") {
+			body = buildCsvProfile(text, extensionOf(basePath) === "tsv" ? "\t" : ",");
+			engine = "csv";
+		} else {
+			body = buildJsonlProfile(text);
+			engine = body ? "jsonl" : undefined;
+		}
+		if (engine && body) {
+			const rendered = renderStructure(input.path, decision.lines, engine, body);
+			structCacheSet(cacheKey, { text: rendered, engine, lines: decision.lines });
+			return decorate({
+				content: [{ type: "text", text: rendered }],
+				details: { shunt: true, engine, lines: decision.lines },
+			});
 		}
 
-		// Failed deterministic engines preserve the original result; only other text uses the worker.
-		if (kind !== "other") return decorate();
-		if (cfg.nonCode === "passthrough") return decorate();
-		if (buf.length > MAX_WORKER_CHARS) return decorate();
-		// Egress boundary: raw content leaves the machine only for files inside
-		// the project. Reads of files outside cwd (sensitive user/system files)
-		// pass through unchanged.
-		// Worker egress is restricted to files within cwd.
-		if (!isWithinCwd(ctx.cwd, absPath)) return decorate();
-		// stat + worker + minLines identify the content and the summarizer; the
-		// stat was taken before the read above, so a concurrent write can only
-		// make the key stale-safe (next read sees a different mtime/size).
-		const workerKey = `${absPath}\u0000${st.mtimeMs}\u0000${st.size}\u0000${cfg.worker}\u0000${cfg.minLines}`;
-		let summary = lruGet(workerCache, workerKey);
-		if (!summary) {
-			summary = await runWorker(ctx, cfg, [{ path: input.path, content: buf.toString("utf8") }], ctx.signal);
-			if (!summary) return decorate();
-			lruSet(workerCache, workerKey, summary);
-		}
-
-		const ref = parseWorkerRef(cfg.worker);
-		const model = ref ? ctx.modelRegistry.find(ref.provider, ref.modelId) : undefined;
-		return {
-			content: [
-				{
-					type: "text",
-					text: labelSummary(input.path, decision.lines, model ? `${model.provider}/${model.id}` : cfg.worker) + summary,
-				},
-			],
-			details: { shunt: true, engine: "worker", lines: decision.lines, worker: cfg.worker },
-		};
+		return decorate();
 	});
 
 	// Bash rule: direct reads of large files via cat/head/tail/less/more.
