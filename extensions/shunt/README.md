@@ -19,21 +19,27 @@
 
 Targeted read、小檔（≤`minLines`）、其他副檔名、image、binary、不存在的檔案、read 出錯、超過 size cap、引擎失敗（parse 錯誤行 >10%、沒有 heading、tree-sitter 無法載入）。
 
-## 設定（`<cwd>/.pi/shunt.json`）
+## 設定
+
+安裝即啟用。設定放在 pi `settings.json` 的 `shunt` key：全域 `~/.pi/agent/settings.json`，專案 `.pi/settings.json`（專案受信任時才讀）會覆蓋全域。
 
 ```json
 {
-	"minLines": 350,
-	"languages": ["ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "sh"]
+	"shunt": {
+		"enabled": true,
+		"minLines": 350,
+		"languages": ["ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "sh"]
+	}
 }
 ```
 
 | 欄位 | 預設 | 說明 |
 |---|---|---|
+| `enabled` | `true` | `false` 停用 shunt |
 | `minLines` | `350` | 超過此行數的整檔讀取才會被攔截 |
 | `languages` | 上列十種 | 收縮 code 判定範圍，只收縮不擴充 grammar 集 |
 
-沒有 shunt.json 或解析失敗時 shunt 停用。
+`shunt` 不是 object，或 settings.json 無法解析時，shunt 停用。
 
 ## 限界
 

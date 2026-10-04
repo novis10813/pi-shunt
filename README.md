@@ -10,12 +10,20 @@ with a structure index, so the content stays out of the main context:
 Everything runs locally. Other file types, targeted reads, and small files pass
 through unchanged. See [extensions/shunt/README.md](extensions/shunt/README.md).
 
-Config is `<cwd>/.pi/shunt.json`. Without it, shunt is off.
+shunt is on once installed. Optional settings go under the `shunt` key in
+pi's `settings.json` (global `~/.pi/agent/settings.json`, overridden by a trusted
+project's `.pi/settings.json`):
+
+```json
+{
+  "shunt": { "enabled": true, "minLines": 350 }
+}
+```
 
 ## Install
 
 ```bash
-pi install -l git:github.com/novis10813/pi-shunt
+pi install git:github.com/novis10813/pi-shunt
 ```
 
 pi runs `npm install` for the package (one dependency, `@vscode/tree-sitter-wasm`).

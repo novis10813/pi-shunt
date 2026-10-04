@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, type Stats } from "node:fs";
+import { existsSync, type Stats } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import {
-	CONFIG_DIR_NAME,
+	SettingsManager,
+	getAgentDir,
 	isReadToolResult,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -27,7 +28,8 @@ import {
  *
  * read rule (tool_result hook, shunt registers NO tool): after a successful,
  * non-targeted full read of a code or markdown file above minLines, the
- * result is replaced by a local structure index (config: <cwd>/.pi/shunt.json):
+ * result is replaced by a local structure index. Config is the `shunt` key of
+ * pi's settings.json (global, overridden by a trusted project's .pi/settings.json):
  *   - code — tree-sitter index (up to 1MB);
  *   - markdown — heading outline (up to 20MB).
  * Targeted reads, small files, other file types, images, binaries, missing
@@ -66,12 +68,14 @@ function announceOnce(ctx: ExtensionContext, key: string, message: string) {
 	if (ctx.hasUI) ctx.ui.notify(message, "warning");
 }
 
-/** Load and validate <cwd>/.pi/shunt.json; undefined disables shunt (fail open). */
-function loadConfig(cwd: string): ShuntConfig | undefined {
-	const file = join(cwd, CONFIG_DIR_NAME, "shunt.json");
-	if (!existsSync(file)) return undefined;
+/** Read the merged `shunt` settings; undefined disables shunt (fail open). */
+function loadConfig(ctx: ExtensionContext): ShuntConfig | undefined {
 	try {
-		return normalizeConfig(JSON.parse(readFileSync(file, "utf8")));
+		const projectTrusted = ctx.isProjectTrusted?.() ?? false;
+		const manager = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted });
+		// An unreadable settings file would silently look like "no settings".
+		if (manager.drainErrors().length > 0) return undefined;
+		return normalizeConfig((manager.getSettings() as Record<string, unknown>).shunt);
 	} catch {
 		return undefined;
 	}
@@ -95,7 +99,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.content.some((part) => part.type !== "text")) return;
 		const input = event.input as ReadToolInput;
 		if (typeof input?.path !== "string") return;
-		const cfg = loadConfig(ctx.cwd);
+		const cfg = loadConfig(ctx);
 		if (!cfg || isTargetedRead(input)) return;
 
 		const literalPath = isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path);

@@ -20,10 +20,15 @@ export const DEFAULT_CONFIG: ShuntConfig = {
 	languages: DEFAULT_LANGUAGES,
 };
 
-/** Validate a parsed shunt.json object; undefined when unusable. */
+/**
+ * Resolve the `shunt` settings value. Absent means defaults (shunt is on once
+ * installed); `enabled: false` or a non-object value turns shunt off.
+ */
 export function normalizeConfig(raw: unknown): ShuntConfig | undefined {
-	if (!raw || typeof raw !== "object") return undefined;
+	if (raw === undefined) return { ...DEFAULT_CONFIG };
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
 	const obj = raw as Record<string, unknown>;
+	if (obj.enabled === false) return undefined;
 	const minLines =
 		typeof obj.minLines === "number" && Number.isFinite(obj.minLines) && obj.minLines >= 0
 			? Math.max(1, Math.floor(obj.minLines))

@@ -65,6 +65,10 @@ check("normalizeConfig defaults and validation", () => {
 	assert.deepEqual(normalizeConfig({ minLines: 500 }), { minLines: 500, languages: baseLangs });
 	assert.deepEqual(normalizeConfig({ minLines: -5 }), { minLines: 350, languages: baseLangs });
 	assert.equal(normalizeConfig(null), undefined);
+	assert.deepEqual(normalizeConfig(undefined), { minLines: 350, languages: baseLangs }, "absent settings mean defaults");
+	assert.equal(normalizeConfig({ enabled: false }), undefined);
+	assert.equal(normalizeConfig([]), undefined);
+	assert.equal(normalizeConfig("on"), undefined);
 });
 
 check("minLines fractional and invalid values never become zero", () => {
@@ -588,7 +592,11 @@ if (!piDist) {
 		join(fixtureDir, "garbage.ts"),
 		`${Array.from({ length: 400 }, (_, i) => `@@@ ### not code line ${i} ???`).join("\n")}\n`,
 	);
-	writeFileSync(join(fixtureDir, ".pi", "shunt.json"), JSON.stringify({ minLines: 350 }));
+	// Isolate from the real ~/.pi/agent/settings.json.
+	const agentDir = mkdtempSync(join(tmpdir(), "shunt-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	const globalSettings = join(agentDir, "settings.json");
+	const projectSettings = join(fixtureDir, ".pi", "settings.json");
 
 	const tools = {};
 	const handlers = [];
@@ -599,7 +607,8 @@ if (!piDist) {
 		on: (name, fn) => handlers.push({ name, fn }),
 		registerCommand: () => {},
 	});
-	const ctx = { cwd: fixtureDir, hasUI: false, ui: { notify: () => {} } };
+	let trusted = false;
+	const ctx = { cwd: fixtureDir, hasUI: false, ui: { notify: () => {} }, isProjectTrusted: () => trusted };
 
 	const readHandler = handlers.find((h) => h.name === "tool_result");
 	check("read: only a tool_result handler is registered, and shunt registers no tools", () => {
@@ -652,14 +661,24 @@ if (!piDist) {
 	await checkAsync("read rule: error results are untouched", async () => {
 		assert.equal(await readHandler.fn(readEvent({ path: "big.ts" }, { isError: true }), ctx), undefined);
 	});
-	await checkAsync("read rule: no shunt.json disables shunt", async () => {
-		const cfgPath = join(fixtureDir, ".pi", "shunt.json");
-		const originalCfg = readFileSync(cfgPath, "utf8");
+	await checkAsync("settings: on by default; shunt key in global and trusted project settings", async () => {
 		try {
-			rmSync(cfgPath);
-			assert.equal(await read({ path: "big.md" }), undefined);
+			assert.ok(await read({ path: "big.md" }), "no settings file: enabled with defaults");
+			writeFileSync(globalSettings, JSON.stringify({ shunt: { enabled: false } }));
+			assert.equal(await read({ path: "big.md" }), undefined, "global enabled:false disables");
+			writeFileSync(projectSettings, JSON.stringify({ shunt: { enabled: true } }));
+			assert.equal(await read({ path: "big.md" }), undefined, "untrusted project settings are ignored");
+			trusted = true;
+			assert.ok(await read({ path: "big.md" }), "trusted project settings override global");
+			writeFileSync(globalSettings, JSON.stringify({ shunt: { minLines: 1000 } }));
+			rmSync(projectSettings);
+			assert.equal(await read({ path: "big.md" }), undefined, "global minLines applies");
+			writeFileSync(globalSettings, "{ not json");
+			assert.equal(await read({ path: "big.md" }), undefined, "broken settings fail open");
 		} finally {
-			writeFileSync(cfgPath, originalCfg);
+			trusted = false;
+			rmSync(globalSettings, { force: true });
+			rmSync(projectSettings, { force: true });
 		}
 	});
 
@@ -757,6 +776,7 @@ if (!piDist) {
 	});
 
 	rmSync(fixtureDir, { recursive: true, force: true });
+	rmSync(agentDir, { recursive: true, force: true });
 }
 
 console.log(process.exitCode ? `\n${passed} passed, with failures` : `\n${passed} checks passed`);
