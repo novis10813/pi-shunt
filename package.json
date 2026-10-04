@@ -1,0 +1,16 @@
+{
+	"name": "pi-shunt-ripple",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "pi extensions: shunt (token routing for large file reads) and ripple (post-turn lint delta and rename hints), sharing a lint core",
+	"scripts": {
+		"test": "node shared/diagnostics/test-diagnostics.mjs && node extensions/shunt/test-shunt.mjs && node extensions/ripple/test-ripple.mjs"
+	},
+	"pi": {
+		"extensions": ["./extensions/shunt/index.ts", "./extensions/ripple/index.ts"]
+	},
+	"dependencies": {
+		"@vscode/tree-sitter-wasm": "0.3.1"
+	}
+}
