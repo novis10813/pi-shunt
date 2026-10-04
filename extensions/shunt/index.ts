@@ -14,8 +14,11 @@ import {
 	MAX_DETERMINISTIC_CHARS,
 	MAX_CODE_PARSE_CHARS,
 	buildCodeIndex,
+	buildCsvProfile,
+	buildJsonlProfile,
 	buildMarkdownOutline,
 	detectKind,
+	extensionOf,
 	grammarForPath,
 	initStructureEngine,
 	renderCodeIndex,
@@ -27,11 +30,12 @@ import {
  * shunt — keeps large file reads out of the main model's context.
  *
  * read rule (tool_result hook, shunt registers NO tool): after a successful,
- * non-targeted full read of a code or markdown file above minLines, the
+ * non-targeted full read of a code, markdown, csv or jsonl file above minLines, the
  * result is replaced by a local structure index. Config is the `shunt` key of
  * pi's settings.json (global, overridden by a trusted project's .pi/settings.json):
  *   - code — tree-sitter index (up to 1MB);
- *   - markdown — heading outline (up to 20MB).
+ *   - markdown — heading outline (up to 20MB);
+ *   - csv/tsv, jsonl/ndjson — rows/fields/sample profile (up to 20MB).
  * Targeted reads, small files, other file types, images, binaries, missing
  * files, and every engine failure keep the original result untouched (fail open).
  *
@@ -116,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 		if (!st.isFile()) return;
 		// The size cap is chosen by extension only (no read needed): code gets
 		// 1MB because tree-sitter's synchronous WASM parse must not stall the
-		// session, markdown gets 20MB.
+		// session, markdown/csv/jsonl get 20MB.
 		const kind = detectKind(basePath, cfg.languages);
 		if (kind === "other") return;
 		const sizeCap = kind === "code" ? MAX_CODE_PARSE_CHARS : MAX_DETERMINISTIC_CHARS;
@@ -159,9 +163,15 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-		} else {
+		} else if (kind === "markdown") {
 			body = buildMarkdownOutline(text);
 			engine = body ? "markdown" : undefined;
+		} else if (kind === "csv") {
+			body = buildCsvProfile(text, extensionOf(basePath) === "tsv" ? "\t" : ",");
+			engine = "csv";
+		} else {
+			body = buildJsonlProfile(text);
+			engine = body ? "jsonl" : undefined;
 		}
 		if (!engine || !body) return;
 		const rendered = renderStructure(input.path, decision.lines, engine, body);

@@ -1,6 +1,6 @@
 # shunt
 
-把「大檔整檔讀取」的內容卸載出主模型 context。code 與 markdown 走本地確定性引擎產出結構索引，不呼叫任何 model，檔案不出機。
+把「大檔整檔讀取」的內容卸載出主模型 context。code、markdown、csv、jsonl 走本地確定性引擎產出結構索引，不呼叫任何 model，檔案不出機。
 
 ## 行為（`tool_result(read)` hook，shunt 不註冊任何 tool）
 
@@ -10,14 +10,16 @@
 |---|---|---|---|
 | code（`ts,tsx,js,jsx,mjs,cjs,py,rs,go,sh`，可經 `languages` 收縮） | tree-sitter | 1,000,000 bytes | imports + top-level symbols（完整簽名）+ 一層 class/struct members，1-based 行號 |
 | `md,markdown` | heading outline | 20,000,000 bytes | `## Heading [line]`（fence-aware，depth ≤ 6） |
+| `csv,tsv` | profile | 20,000,000 bytes | rows/columns/欄名（≤20）+ 前 3 行樣本（截 80 chars） |
+| `jsonl,ndjson` | profile | 20,000,000 bytes | rows + 前 100 行 keys（≤20）+ 前 2 行樣本（截 120 chars） |
 
 - 成功時結果替換為 `[shunt] STRUCTURE — not file content. "<path>" (<N> lines). Deterministic index (engine: …)` 加索引，並指引用 targeted read 取精確內容。
-- `details`：`{ shunt: true, engine: "tree-sitter"|"markdown", lines }`。
+- `details`：`{ shunt: true, engine: "tree-sitter"|"markdown"|"csv"|"jsonl", lines }`。
 - code 的 1MB cap 是因為 tree-sitter WASM parse 是同步執行，大檔會卡住 session。
 
 ## 放行（原結果原封不動）
 
-Targeted read、小檔（≤`minLines`）、其他副檔名、image、binary、不存在的檔案、read 出錯、超過 size cap、引擎失敗（parse 錯誤行 >10%、沒有 heading、tree-sitter 無法載入）。
+Targeted read、小檔（≤`minLines`）、其他副檔名、image、binary、不存在的檔案、read 出錯、超過 size cap、引擎失敗（parse 錯誤行 >10%、沒有 heading、jsonl 解析失敗行 >10%、tree-sitter 無法載入）。
 
 ## 設定
 

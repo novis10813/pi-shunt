@@ -25,6 +25,8 @@ import {
 import {
 	buildCodeIndex,
 	initStructureEngine,
+	buildCsvProfile,
+	buildJsonlProfile,
 	buildMarkdownOutline,
 	countSourceLines,
 	detectKind,
@@ -171,6 +173,8 @@ check("detectKind matrix", () => {
 		["a.mjs", "code"], ["a.cjs", "code"], ["a.py", "code"], ["a.rs", "code"],
 		["a.go", "code"], ["a.sh", "code"],
 		["a.md", "markdown"], ["a.markdown", "markdown"],
+		["a.csv", "csv"], ["a.tsv", "csv"],
+		["a.jsonl", "jsonl"], ["a.ndjson", "jsonl"],
 		["a.json", "other"], ["a.txt", "other"], ["Makefile", "other"], [".gitignore", "other"],
 		["dir/foo.bar.ts", "code"], ["/x/y.Foo", "other"],
 		// `languages` shrinks the code set
@@ -498,6 +502,67 @@ check("markdown fences: close on same-char fence at least as long, no closing in
  assert.deepEqual(buildMarkdownOutline("```\ncode\n````\n# shown"), ["# shown [4]"]);
 });
 
+check("CSV quoted newlines remain within a single field and row", () => {
+ assert.deepEqual(buildCsvProfile('a,"b\n c",d\n1,2,3\n', ","), ["CSV — 1 rows, 3 columns:", "Fields: a, b\n c, d", "Sample:", "  1,2,3"]);
+});
+
+check("csv/tsv profile (empty, header-only, fields, sample truncation)", () => {
+	assert.deepEqual(buildCsvProfile("a,b,c\n1,2,3\n4,5,6\n7,8,9\n", ","), [
+		"CSV — 3 rows, 3 columns:",
+		"Fields: a, b, c",
+		"Sample:",
+		"  1,2,3",
+		"  4,5,6",
+		"  7,8,9",
+	]);
+	assert.deepEqual(buildCsvProfile("", ","), ["CSV — 0 rows, 0 columns:"]);
+	assert.deepEqual(buildCsvProfile("a,b,c\n", ","), [
+		"CSV — 0 rows, 3 columns:",
+		"Fields: a, b, c",
+	]);
+	// >20 fields → capped with (+N)
+	const wideCsv =
+		Array.from({ length: 25 }, (_, i) => `f${i}`).join(",") +
+		"\n" +
+		Array.from({ length: 25 }, (_, i) => String(i)).join(",") +
+		"\n";
+	const wcsv = buildCsvProfile(wideCsv, ",");
+	assert.equal(wcsv?.[1], `Fields: ${Array.from({ length: 20 }, (_, i) => `f${i}`).join(", ")} (+5)`);
+	// tsv delimiter
+	assert.equal(buildCsvProfile("x\ty\tz\n1\t2\t3\n", "\t")[1], "Fields: x, y, z");
+	// quote-aware column counting
+	assert.equal(buildCsvProfile('a,"b,c",d\n', ",")[1], "Fields: a, b,c, d");
+	// sample row truncated at 80 chars (+ "…")
+	const longCsv = `a,b\n1,${"x".repeat(120)}\n`;
+	assert.equal(buildCsvProfile(longCsv, ",")[3].length, 2 + 80 + 1);
+});
+
+check("jsonl profile (keys, failure rate, truncation)", () => {
+	const j = buildJsonlProfile('{"a":1,"b":2}\n{"b":3,"c":4}\n{"d":5}\n');
+	assert.ok(j);
+	assert.equal(j[0], "JSONL — 3 rows; keys in first 100 rows: a, b, c, d:");
+	assert.equal(j[1], "Sample:");
+	assert.equal(j[2], '  {"a":1,"b":2}');
+	assert.equal(j[3], '  {"b":3,"c":4}');
+	// >20 keys → capped with (+N)
+	const jk = buildJsonlProfile(Array.from({ length: 25 }, (_, i) => `{"k${i}":1}`).join("\n"));
+	assert.ok(jk);
+	assert.equal(
+		jk[0],
+		"JSONL — 25 rows; keys in first 100 rows: " +
+			Array.from({ length: 20 }, (_, i) => `k${i}`).join(", ") +
+			" (+5):",
+	);
+	// >10% failing lines → undefined; exactly 10% (1/10) → kept
+	assert.equal(buildJsonlProfile('{"a":1}\nx\ny\nz\n'), undefined);
+	assert.ok(buildJsonlProfile(Array.from({ length: 9 }, (_, i) => `{"a":${i}}`).concat("bad").join("\n")));
+	assert.equal(buildJsonlProfile(""), undefined);
+	assert.equal(buildJsonlProfile("   \n\n  \n"), undefined);
+	// sample row truncated at 120 chars
+	const longJsonl = `{"a":"${"y".repeat(200)}"}\n{"b":1}\n`;
+	assert.equal(buildJsonlProfile(longJsonl)[2].length, 2 + 120);
+});
+
 check("renderStructure: exact label + 40k char backstop", () => {
 	const out = renderStructure("/x/big.ts", 1234, "tree-sitter", ["- a (function) [1-2]"]);
 	assert.equal(
@@ -576,6 +641,14 @@ if (!piDist) {
 			...Array.from({ length: 398 }, (_, i) => (i % 2 ? `line ${i + 1}` : `### Sub ${i}`)),
 			"",
 		].join("\n"),
+	);
+	writeFileSync(
+		join(fixtureDir, "big.csv"),
+		`a,b,c\n${Array.from({ length: 399 }, (_, i) => `${i},${i * 2},${i * 3}`).join("\n")}\n`,
+	);
+	writeFileSync(
+		join(fixtureDir, "big.jsonl"),
+		`${Array.from({ length: 400 }, (_, i) => JSON.stringify({ a: i, b: `s${i}`, c: i % 7 })).join("\n")}\n`,
 	);
 	writeFileSync(join(fixtureDir, "big1mb.ts"), `${Array.from({ length: 3000 }, (_, i) => `const pad${i} = "${"x".repeat(490)}";`).join("\n")}\n`);
 	// ~3MB of valid TS: above the 1MB code parse gate -> passthrough (no parse)
@@ -708,6 +781,23 @@ if (!piDist) {
 		assert.ok(r.content[0].text.includes("# Title [1]"));
 		assert.ok(r.content[0].text.includes("## Intro [3]"));
 		assert.equal(r.details.engine, "markdown");
+	});
+
+	await checkAsync("read rule: large .csv -> STRUCTURE (csv)", async () => {
+		const r = await read({ path: "big.csv" });
+		assert.ok(r);
+		assert.ok(r.content[0].text.includes("Deterministic index (engine: csv)"), r.content[0].text.slice(0, 200));
+		assert.ok(r.content[0].text.includes("CSV — 399 rows, 3 columns:"));
+		assert.ok(r.content[0].text.includes("Fields: a, b, c"));
+		assert.equal(r.details.engine, "csv");
+	});
+
+	await checkAsync("read rule: large .jsonl -> STRUCTURE (jsonl)", async () => {
+		const r = await read({ path: "big.jsonl" });
+		assert.ok(r);
+		assert.ok(r.content[0].text.includes("Deterministic index (engine: jsonl)"), r.content[0].text.slice(0, 200));
+		assert.ok(r.content[0].text.includes("JSONL — 400 rows; keys in first 100 rows: a, b, c:"));
+		assert.equal(r.details.engine, "jsonl");
 	});
 
 	await checkAsync("read rule: failed deterministic engine preserves original result", async () => {

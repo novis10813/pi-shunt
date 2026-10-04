@@ -6,6 +6,8 @@
 // Engines (spec: docs/shunt_v2_spec.md on the archive/full branch):
 //   code     — tree-sitter index via @vscode/tree-sitter-wasm (lazy dynamic import)
 //   markdown — heading outline (fence-aware)
+//   csv      — rows/columns/fields/sample profile
+//   jsonl    — rows/keys/sample profile
 //
 // All builders fail-open: unparseable / unsupported input → undefined, and the
 // caller keeps the original tool result untouched.
@@ -17,12 +19,12 @@ import { dirname, join } from "node:path";
 // Constants (spec §3.3–§3.5)
 // ---------------------------------------------------------------------------
 
-/** Size gate for the markdown outline (chars). */
+/** Size gate for markdown/csv/jsonl engines (chars). */
 export const MAX_DETERMINISTIC_CHARS = 20_000_000;
 /**
  * Code files larger than this pass through unread: tree-sitter's WASM parse
  * runs synchronously on the main thread, and a large parse would stall the
- * whole session. The markdown outline stays on MAX_DETERMINISTIC_CHARS
+ * whole session. Markdown/csv/jsonl profiles stay on MAX_DETERMINISTIC_CHARS
  * (line-based, no parse stall).
  */
 export const MAX_CODE_PARSE_CHARS = 1_000_000;
@@ -31,13 +33,18 @@ const RENDER_CHAR_CAP = 40_000; // backstop on rendered output (signatures are n
 const MAX_CODE_ENTRIES = 400; // backstop: top-level entries + member lines
 const MAX_MD_ENTRIES = 100;
 const MAX_IMPORTS = 20;
+const MAX_LIST_ITEMS = 20; // fields / keys
+const CSV_SAMPLE_ROWS = 3;
+const CSV_SAMPLE_CHARS = 80;
+const JSONL_SAMPLE_ROWS = 2;
+const JSONL_SAMPLE_CHARS = 120;
 const MAX_ERROR_LINE_RATIO = 0.1; // >10% error lines → not code
 
 // ---------------------------------------------------------------------------
 // Kind detection (spec §3.2)
 // ---------------------------------------------------------------------------
 
-export type FileKind = "code" | "markdown" | "other";
+export type FileKind = "code" | "markdown" | "csv" | "jsonl" | "other";
 export type CodeLangId =
 	| "typescript"
 	| "tsx"
@@ -46,7 +53,7 @@ export type CodeLangId =
 	| "rust"
 	| "go"
 	| "bash";
-export type EngineName = "tree-sitter" | "markdown";
+export type EngineName = "tree-sitter" | "markdown" | "csv" | "jsonl";
 
 export const DEFAULT_LANGUAGES = ["ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "sh"];
 
@@ -63,6 +70,8 @@ const EXT_GRAMMAR: Record<string, CodeLangId> = {
 	sh: "bash",
 };
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
+const CSV_EXTS = new Set(["csv", "tsv"]);
+const JSONL_EXTS = new Set(["jsonl", "ndjson"]);
 
 /** Last extension of the final path segment, lowercased; "" when absent. */
 export function extensionOf(path: string): string {
@@ -79,6 +88,8 @@ export function detectKind(
 	if (grammarForPath(path, languages)) return "code";
 	const ext = extensionOf(path);
 	if (MARKDOWN_EXTS.has(ext)) return "markdown";
+	if (CSV_EXTS.has(ext)) return "csv";
+	if (JSONL_EXTS.has(ext)) return "jsonl";
 	return "other";
 }
 
@@ -796,6 +807,133 @@ export function buildMarkdownOutline(source: string): string[] | undefined {
 	if (total > MAX_MD_ENTRIES) {
 		out.length = MAX_MD_ENTRIES;
 		out.push(`… +${total - MAX_MD_ENTRIES} more entries（total ${total}；用 targeted read 取精確內容）`);
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// CSV / TSV profile (spec §3.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * `CSV — N rows, K columns:` + field names + up to 3 sample rows.
+ * Empty file → still produced with 0 rows.
+ */
+export function buildCsvProfile(source: string, delimiter: "," | "\t"): string[] | undefined {
+	// One pass, no per-character string building: only the header and the sample
+	// rows are ever sliced out; every other record is just counted (~20MB input).
+	const lines: string[] = []; // header + up to CSV_SAMPLE_ROWS sample records
+	let records = 0;
+	let rowStart = 0;
+	let quoted = false;
+	let blank = true;
+	const endRow = (end: number) => {
+		if (!blank) {
+			records++;
+			if (lines.length <= CSV_SAMPLE_ROWS) lines.push(source.slice(rowStart, end));
+		}
+		blank = true;
+	};
+	for (let i = 0; i < source.length; i++) {
+		const c = source[i];
+		if (c === '"') {
+			blank = false;
+			if (quoted && source[i + 1] === '"') { i++; continue; }
+			quoted = !quoted;
+		} else if (c === "\n" && !quoted) {
+			endRow(i);
+			rowStart = i + 1;
+		} else if (blank && !/\s/.test(c)) blank = false;
+	}
+	endRow(source.length);
+	if (lines.length === 0) return ["CSV — 0 rows, 0 columns:"];
+	const fields = splitCsvLine(lines[0], delimiter);
+	const dataRows = lines.slice(1);
+	const out: string[] = [`CSV — ${records - 1} rows, ${fields.length} columns:`];
+	if (fields.length > 0) {
+		const shown = fields.slice(0, MAX_LIST_ITEMS);
+		out.push(
+			`Fields: ${shown.join(", ")}${fields.length > MAX_LIST_ITEMS ? ` (+${fields.length - MAX_LIST_ITEMS})` : ""}`,
+		);
+	}
+	const samples = dataRows.slice(0, CSV_SAMPLE_ROWS);
+	if (samples.length > 0) {
+		out.push("Sample:");
+		for (const s of samples) {
+			out.push(`  ${s.slice(0, CSV_SAMPLE_CHARS)}${s.length > CSV_SAMPLE_CHARS ? "…" : ""}`);
+		}
+	}
+	return out;
+}
+
+/** Quote-aware single-line CSV split. */
+function splitCsvLine(line: string, d: string): string[] {
+	const out: string[] = [];
+	let cur = "";
+	let inQ = false;
+	for (let i = 0; i < line.length; i++) {
+		const c = line[i];
+		if (inQ) {
+			if (c === '"') {
+				if (line[i + 1] === '"') {
+					cur += '"';
+					i++;
+				} else inQ = false;
+			} else cur += c;
+		} else if (c === '"') {
+			inQ = true;
+		} else if (c === d) {
+			out.push(cur.trim());
+			cur = "";
+		} else cur += c;
+	}
+	out.push(cur.trim());
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// JSONL profile (spec §3.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * `JSONL — N rows; keys in first 100 rows: …` + up to 2 sample rows.
+ * Undefined when empty or >10% of lines fail to parse.
+ */
+export function buildJsonlProfile(source: string): string[] | undefined {
+	const lines = source.split("\n").filter((l) => l.trim() !== "");
+	if (lines.length === 0) return undefined;
+	let ok = 0;
+	let failed = 0;
+	const keys: string[] = [];
+	const keySet = new Set<string>();
+	const samples: string[] = [];
+	for (const line of lines) {
+		let obj: unknown;
+		try {
+			obj = JSON.parse(line);
+		} catch {
+			failed++;
+			continue;
+		}
+		ok++;
+		if (samples.length < JSONL_SAMPLE_ROWS) samples.push(line.slice(0, JSONL_SAMPLE_CHARS));
+		if (ok <= 100 && obj && typeof obj === "object" && !Array.isArray(obj)) {
+			for (const k of Object.keys(obj as Record<string, unknown>)) {
+				if (!keySet.has(k)) {
+					keySet.add(k);
+					if (keys.length < MAX_LIST_ITEMS) keys.push(k);
+				}
+			}
+		}
+	}
+	if (failed / lines.length > MAX_ERROR_LINE_RATIO) return undefined;
+	const moreKeys = Math.max(0, keySet.size - MAX_LIST_ITEMS);
+	const keyPart =
+		keySet.size > 0 ? `${keys.join(", ")}${moreKeys > 0 ? ` (+${moreKeys})` : ""}` : "(none)";
+	const out: string[] = [`JSONL — ${ok} rows; keys in first 100 rows: ${keyPart}:`];
+	if (samples.length > 0) {
+		out.push("Sample:");
+		for (const s of samples) out.push(`  ${s}`);
 	}
 	return out;
 }
